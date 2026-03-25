@@ -188,6 +188,7 @@ class Hermes2ProToolParser(ToolParser):
         #    function for buffering before being used for parsing.
 
         delta_text = self.tool_call_delta_buffer(delta_text)
+        raw_delta_text = delta_text
         # If the last characters of previous_text
         # match self.buffered_delta_text, remove only the matching part.
         if (
@@ -278,6 +279,44 @@ class Hermes2ProToolParser(ToolParser):
                 and cur_tool_end_count >= prev_tool_end_count
             ):
                 if self.prev_tool_call_arr is None or len(self.prev_tool_call_arr) == 0:
+                    if tool_call_portion and cur_tool_start_count > prev_tool_start_count:
+                        try:
+                            current_tool_call = json.loads(tool_call_portion)
+                        except json.decoder.JSONDecodeError:
+                            logger.debug("unable to parse single-chunk tool call JSON")
+                            return None
+
+                        function_name = current_tool_call.get("name")
+                        arguments = current_tool_call.get("arguments")
+                        if function_name and arguments is not None:
+                            arguments_json = (
+                                arguments
+                                if isinstance(arguments, str)
+                                else json.dumps(arguments, ensure_ascii=False)
+                            )
+                            self.current_tool_id += 1
+                            self.current_tool_name_sent = True
+                            self.prev_tool_call_arr.append(current_tool_call)
+                            self.streamed_args_for_tool.append(arguments_json)
+                            content = (
+                                raw_delta_text.split(self.tool_call_start_token, 1)[0]
+                                or None
+                            )
+                            return DeltaMessage(
+                                content=content,
+                                tool_calls=[
+                                    DeltaToolCall(
+                                        index=self.current_tool_id,
+                                        type="function",
+                                        id=make_tool_call_id(),
+                                        function=DeltaFunctionCall(
+                                            name=function_name,
+                                            arguments=arguments_json,
+                                        ).model_dump(exclude_none=True),
+                                    )
+                                ],
+                            )
+
                     logger.debug("attempting to close tool call, but no tool call")
                     return None
                 diff = self.prev_tool_call_arr[self.current_tool_id].get("arguments")
