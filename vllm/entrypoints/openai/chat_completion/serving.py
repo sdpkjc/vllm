@@ -1200,12 +1200,12 @@ class OpenAIServingChat(OpenAIServing):
 
                         if (
                             self._should_check_for_unstreamed_tool_arg_tokens(
-                                delta_message, output
+                                delta_message, output, tool_parser, index
                             )
                             and tool_parser
                         ):
                             latest_delta_len = 0
-                            if (
+                            if delta_message and delta_message.tool_calls and (
                                 isinstance(
                                     delta_message.tool_calls[0].function,
                                     DeltaFunctionCall,
@@ -1244,10 +1244,13 @@ class OpenAIServingChat(OpenAIServing):
 
                             # check to see if there's anything left to stream
                             remaining_call = expected_call.replace(actual_call, "", 1)
-                            # set that as a delta message
-                            delta_message = self._create_remaining_args_delta(
-                                delta_message, remaining_call, index
-                            )
+                            if remaining_call:
+                                # set that as a delta message
+                                delta_message = self._create_remaining_args_delta(
+                                    delta_message or DeltaMessage(),
+                                    remaining_call,
+                                    index,
+                                )
 
                         # Send the finish response for each request.n only once
                         # In OpenAI's API, when a tool is called, the
@@ -1858,6 +1861,8 @@ class OpenAIServingChat(OpenAIServing):
         self,
         delta_message: DeltaMessage | None,
         output: CompletionOutput,
+        tool_parser: ToolParser | None,
+        index: int,
     ) -> bool:
         """
         Check to see if we should check for unstreamed tool arguments tokens.
@@ -1866,16 +1871,13 @@ class OpenAIServingChat(OpenAIServing):
         """
 
         return bool(
-            # if there is a delta message that includes tool calls which
-            # include a function that has arguments
             output.finish_reason is not None
             and self.enable_auto_tools
             and self.tool_parser
-            and delta_message
-            and delta_message.tool_calls
-            and delta_message.tool_calls[0]
-            and delta_message.tool_calls[0].function
-            and delta_message.tool_calls[0].function.arguments is not None
+            and tool_parser
+            and len(tool_parser.prev_tool_call_arr) > index
+            and len(tool_parser.streamed_args_for_tool) > index
+            and tool_parser.prev_tool_call_arr[index].get("arguments")
         )
 
     @staticmethod

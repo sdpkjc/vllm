@@ -51,6 +51,9 @@ class Hermes2ProToolParser(ToolParser):
         self.tool_call_regex = re.compile(
             r"<tool_call>(.*?)</tool_call>|<tool_call>(.*)", re.DOTALL
         )
+        self.complete_tool_call_regex = re.compile(
+            r"<tool_call>(.*?)</tool_call>", re.DOTALL
+        )
         self.scratch_pad_regex = re.compile(
             r"<scratch_pad>(.*?)</scratch_pad>", re.DOTALL
         )
@@ -78,6 +81,43 @@ class Hermes2ProToolParser(ToolParser):
         ]
 
         self.buffered_delta_text = ""
+
+    def _extract_complete_tool_call_portion(
+        self, text: str, tool_index: int
+    ) -> str | None:
+        matches = self.complete_tool_call_regex.findall(text)
+        if not matches:
+            return None
+        if 0 <= tool_index < len(matches):
+            return matches[tool_index].rstrip()
+        return matches[-1].rstrip()
+
+    def _prime_following_tool_state(self, trailing_text: str) -> None:
+        if self.tool_call_start_token not in trailing_text:
+            return
+
+        next_tool_portion = trailing_text.split(self.tool_call_start_token, 1)[-1]
+        self.current_tool_id += 1
+        self.current_tool_name_sent = False
+        self.streamed_args_for_tool.append("")
+
+        try:
+            next_tool_call = partial_json_parser.loads(
+                next_tool_portion or "{}",
+                Allow.ALL & ~Allow.STR,
+            )
+            if not isinstance(next_tool_call, dict):
+                next_tool_call = {}
+        except (
+            partial_json_parser.core.exceptions.MalformedJSON,
+            json.decoder.JSONDecodeError,
+        ):
+            next_tool_call = {}
+
+        if len(self.prev_tool_call_arr) <= self.current_tool_id:
+            self.prev_tool_call_arr.append(next_tool_call)
+        else:
+            self.prev_tool_call_arr[self.current_tool_id] = next_tool_call
 
     # Very simple idea: when encountering tokens like <, tool, _call, >,
     # <, /, tool, _call, >, store them in a buffer.
@@ -215,6 +255,11 @@ class Hermes2ProToolParser(ToolParser):
             cur_tool_end_count = current_text.count(self.tool_call_end_token)
             tool_call_portion = None
             text_portion = None
+            trailing_tool_text = None
+            close_active_tool = (
+                self.tool_call_end_token in raw_delta_text
+                and prev_tool_start_count > prev_tool_end_count
+            )
 
             # case: if we're generating text, OR rounding out a tool call
             if (
@@ -227,14 +272,18 @@ class Hermes2ProToolParser(ToolParser):
 
             if self.tool_call_end_token in delta_text:
                 logger.debug("tool_call_end_token in delta_text")
-                full_text = current_text + delta_text
-                tool_call_portion = (
-                    full_text.split(self.tool_call_start_token)[-1]
-                    .split(self.tool_call_end_token)[0]
-                    .rstrip()
+                tool_index = (
+                    self.current_tool_id
+                    if self.current_tool_id >= 0
+                    else cur_tool_end_count - 1
                 )
-                delta_text = delta_text.split(self.tool_call_end_token)[0].rstrip()
-                text_portion = delta_text.split(self.tool_call_end_token)[-1].lstrip()
+                tool_call_portion = self._extract_complete_tool_call_portion(
+                    current_text, tool_index
+                )
+                delta_text, text_portion = raw_delta_text.split(
+                    self.tool_call_end_token, 1
+                )
+                delta_text = delta_text.rstrip()
 
             # case: if tool open & close tag counts don't match, we're doing
             # imaginary "else" block here
@@ -243,42 +292,63 @@ class Hermes2ProToolParser(ToolParser):
             # "Allow" are handled via BIT MASK
             flags = Allow.ALL if self.current_tool_name_sent else Allow.ALL & ~Allow.STR
 
-            # case -- we're starting a new tool call
-            if (
-                cur_tool_start_count > cur_tool_end_count
-                and cur_tool_start_count > prev_tool_start_count
-            ):
-                if len(delta_token_ids) > 1:
-                    tool_call_portion = current_text.split(self.tool_call_start_token)[
-                        -1
-                    ]
-                else:
-                    tool_call_portion = None
-                    delta = None
-
-                text_portion = None
-
-                # set cursors and state appropriately
-                self.current_tool_id += 1
-                self.current_tool_name_sent = False
-                self.streamed_args_for_tool.append("")
-                logger.debug("Starting on a new tool %s", self.current_tool_id)
-
-            # case -- we're updating an existing tool call
-            elif (
-                cur_tool_start_count > cur_tool_end_count
-                and cur_tool_start_count == prev_tool_start_count
-            ):
-                # get the portion of the text that's the tool call
-                tool_call_portion = current_text.split(self.tool_call_start_token)[-1]
-                text_portion = None
-
             # case -- the current tool call is being closed.
-            elif (
+            if close_active_tool or (
                 cur_tool_start_count == cur_tool_end_count
                 and cur_tool_end_count >= prev_tool_end_count
             ):
+                emitted_content = None
+                closed_tool_id = self.current_tool_id
+                if text_portion:
+                    if self.tool_call_start_token in text_portion:
+                        emitted_content = (
+                            text_portion.split(self.tool_call_start_token, 1)[0] or None
+                        )
+                        trailing_tool_text = text_portion
+                    else:
+                        emitted_content = text_portion or None
+
                 if self.prev_tool_call_arr is None or len(self.prev_tool_call_arr) == 0:
+                    if (
+                        self.current_tool_id >= 0
+                        and self.current_tool_name_sent
+                        and tool_call_portion
+                    ):
+                        try:
+                            current_tool_call = json.loads(tool_call_portion)
+                        except json.decoder.JSONDecodeError:
+                            logger.debug("unable to parse closing tool call JSON")
+                            return None
+
+                        arguments = current_tool_call.get("arguments")
+                        arguments_json = (
+                            arguments
+                            if isinstance(arguments, str)
+                            else json.dumps(arguments, ensure_ascii=False)
+                        )
+                        diff = arguments_json
+                        self.prev_tool_call_arr.append(current_tool_call)
+                        self.streamed_args_for_tool[self.current_tool_id] = (
+                            arguments_json
+                        )
+                        if trailing_tool_text:
+                            self._prime_following_tool_state(trailing_tool_text)
+                        if not diff and emitted_content is None:
+                            return None
+                        return DeltaMessage(
+                            content=emitted_content,
+                            tool_calls=[
+                                DeltaToolCall(
+                                    index=closed_tool_id,
+                                    function=DeltaFunctionCall(
+                                        arguments=diff or None
+                                    ).model_dump(exclude_none=True),
+                                )
+                            ]
+                            if diff
+                            else [],
+                        )
+
                     if tool_call_portion and cur_tool_start_count > prev_tool_start_count:
                         try:
                             current_tool_call = json.loads(tool_call_portion)
@@ -298,15 +368,18 @@ class Hermes2ProToolParser(ToolParser):
                             self.current_tool_name_sent = True
                             self.prev_tool_call_arr.append(current_tool_call)
                             self.streamed_args_for_tool.append(arguments_json)
-                            content = (
+                            prefix_content = (
                                 raw_delta_text.split(self.tool_call_start_token, 1)[0]
-                                or None
+                                or ""
                             )
+                            content = prefix_content + (emitted_content or "")
+                            if trailing_tool_text:
+                                self._prime_following_tool_state(trailing_tool_text)
                             return DeltaMessage(
-                                content=content,
+                                content=content or None,
                                 tool_calls=[
                                     DeltaToolCall(
-                                        index=self.current_tool_id,
+                                        index=closed_tool_id + 1,
                                         type="function",
                                         id=make_tool_call_id(),
                                         function=DeltaFunctionCall(
@@ -319,33 +392,76 @@ class Hermes2ProToolParser(ToolParser):
 
                     logger.debug("attempting to close tool call, but no tool call")
                     return None
-                diff = self.prev_tool_call_arr[self.current_tool_id].get("arguments")
-                if diff:
-                    diff = (
-                        diff.encode("utf-8").decode("unicode_escape")
-                        if diff is str
-                        else diff
-                    )
-                    if '"}' not in delta_text:
-                        return None
-                    end_loc = delta_text.rindex('"}')
-                    diff = delta_text[:end_loc] + '"}'
-                    logger.debug(
-                        "Finishing tool and found diff that had not "
-                        "been streamed yet: %s",
-                        diff,
-                    )
-                    self.streamed_args_for_tool[self.current_tool_id] += diff
-                    return DeltaMessage(
-                        tool_calls=[
-                            DeltaToolCall(
-                                index=self.current_tool_id,
-                                function=DeltaFunctionCall(arguments=diff).model_dump(
-                                    exclude_none=True
-                                ),
-                            )
-                        ]
-                    )
+                if tool_call_portion is None:
+                    return None
+
+                try:
+                    current_tool_call = json.loads(tool_call_portion)
+                except json.decoder.JSONDecodeError:
+                    logger.debug("unable to parse closing tool call JSON")
+                    return None
+
+                arguments = current_tool_call.get("arguments")
+                arguments_json = (
+                    arguments
+                    if isinstance(arguments, str)
+                    else json.dumps(arguments, ensure_ascii=False)
+                )
+                actual_streamed = self.streamed_args_for_tool[self.current_tool_id]
+                if arguments_json.startswith(actual_streamed):
+                    diff = arguments_json[len(actual_streamed) :]
+                else:
+                    diff = arguments_json.replace(actual_streamed, "", 1)
+
+                self.prev_tool_call_arr[self.current_tool_id] = current_tool_call
+                self.streamed_args_for_tool[self.current_tool_id] = arguments_json
+                if trailing_tool_text:
+                    self._prime_following_tool_state(trailing_tool_text)
+                if not diff and emitted_content is None:
+                    return None
+
+                logger.debug(
+                    "Finishing tool and found diff that had not "
+                    "been streamed yet: %s",
+                    diff,
+                )
+                return DeltaMessage(
+                    content=emitted_content,
+                    tool_calls=[
+                        DeltaToolCall(
+                            index=closed_tool_id,
+                            function=DeltaFunctionCall(arguments=diff or None).model_dump(
+                                exclude_none=True
+                            ),
+                        )
+                    ]
+                    if diff
+                    else [],
+                )
+
+            # case -- we're starting a new tool call
+            elif (
+                cur_tool_start_count > cur_tool_end_count
+                and cur_tool_start_count > prev_tool_start_count
+            ):
+                tool_call_portion = current_text.split(self.tool_call_start_token)[-1]
+
+                text_portion = None
+
+                # set cursors and state appropriately
+                self.current_tool_id += 1
+                self.current_tool_name_sent = False
+                self.streamed_args_for_tool.append("")
+                logger.debug("Starting on a new tool %s", self.current_tool_id)
+
+            # case -- we're updating an existing tool call
+            elif (
+                cur_tool_start_count > cur_tool_end_count
+                and cur_tool_start_count == prev_tool_start_count
+            ):
+                # get the portion of the text that's the tool call
+                tool_call_portion = current_text.split(self.tool_call_start_token)[-1]
+                text_portion = None
 
             # case -- otherwise we're just generating text
             else:
@@ -377,6 +493,12 @@ class Hermes2ProToolParser(ToolParser):
                 function_name: str | None = current_tool_call.get("name")
                 if function_name:
                     self.current_tool_name_sent = True
+                    if len(self.prev_tool_call_arr) <= self.current_tool_id:
+                        self.prev_tool_call_arr.append(current_tool_call)
+                    else:
+                        self.prev_tool_call_arr[self.current_tool_id] = (
+                            current_tool_call
+                        )
                     return DeltaMessage(
                         tool_calls=[
                             DeltaToolCall(
