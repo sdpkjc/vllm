@@ -214,6 +214,8 @@ if TYPE_CHECKING:
     VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS: bool = False
     VLLM_SYSTEM_START_DATE: str | None = None
     VLLM_TOOL_JSON_ERROR_AUTOMATIC_RETRY: bool = False
+    VLLM_TOOL_PARSER_ERROR_AUTOMATIC_RETRY: bool = False
+    VLLM_TOOL_PARSER_ERROR_MAX_RETRIES: int = 3
     VLLM_CUSTOM_SCOPES_FOR_PROFILING: bool = False
     VLLM_NVTX_SCOPES_FOR_PROFILING: bool = False
     VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES: bool = True
@@ -1507,6 +1509,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If disabled (default), raises an exception and fails the request
     "VLLM_TOOL_JSON_ERROR_AUTOMATIC_RETRY": lambda: bool(
         int(os.getenv("VLLM_TOOL_JSON_ERROR_AUTOMATIC_RETRY", "0"))
+    ),
+    # Enable automatic retry when tool parser likely failed to recover a tool
+    # call from the model output. This is only used in non-streaming chat
+    # completions, and only for high-confidence parser failure cases.
+    "VLLM_TOOL_PARSER_ERROR_AUTOMATIC_RETRY": lambda: bool(
+        int(os.getenv("VLLM_TOOL_PARSER_ERROR_AUTOMATIC_RETRY", "0"))
+    ),
+    "VLLM_TOOL_PARSER_ERROR_MAX_RETRIES": lambda: int(
+        os.getenv("VLLM_TOOL_PARSER_ERROR_MAX_RETRIES", "3")
     ),
     # Add optional custom scopes for profiling, disable to avoid overheads
     "VLLM_CUSTOM_SCOPES_FOR_PROFILING": lambda: bool(

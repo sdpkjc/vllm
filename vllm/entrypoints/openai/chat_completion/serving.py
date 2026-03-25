@@ -14,6 +14,7 @@ import regex as re
 from fastapi import Request
 from partial_json_parser.core.options import Allow
 
+from vllm import envs
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.chat_utils import (
     ChatTemplateContentFormatOption,
@@ -82,6 +83,25 @@ if TYPE_CHECKING:
     from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 
 logger = init_logger(__name__)
+
+_TOOL_PARSER_RETRY_MARKERS: Final[tuple[str, ...]] = (
+    "<tool_call",
+    "</tool_call>",
+    "<function=",
+    "recipient=",
+    "<｜tool",
+)
+_TOOL_PARSER_RETRY_FEEDBACK: Final = (
+    "Your previous assistant response could not be parsed as a valid tool call. "
+    "Re-answer now. If a tool is needed, emit exactly one valid tool call that "
+    "matches the provided schema and do not include any extra prose. If no tool "
+    "is needed, answer with plain text only."
+)
+_TOOL_PARSER_REQUIRED_RETRY_FEEDBACK: Final = (
+    "Your previous assistant response could not be parsed as a valid tool call. "
+    "Re-answer now by emitting exactly one valid tool call that matches the "
+    "provided schema. Do not include any extra prose."
+)
 
 
 class OpenAIServingChat(OpenAIServing):
@@ -173,6 +193,72 @@ class OpenAIServingChat(OpenAIServing):
                 chat_template_kwargs=self.default_chat_template_kwargs,
             )
         )
+
+    @staticmethod
+    def _get_tool_parser_retry_count(request: ChatCompletionRequest) -> int:
+        return sum(
+            1
+            for message in request.messages
+            if message.get("role") == "user"
+            and message.get("content")
+            in (_TOOL_PARSER_RETRY_FEEDBACK, _TOOL_PARSER_REQUIRED_RETRY_FEEDBACK)
+        )
+
+    def _should_retry_tool_parser_failure(
+        self,
+        request: ChatCompletionRequest,
+        response: ChatCompletionResponse,
+    ) -> bool:
+        if not envs.VLLM_TOOL_PARSER_ERROR_AUTOMATIC_RETRY:
+            return False
+        if self.tool_parser is None:
+            return False
+        if request.stream or self.use_harmony:
+            return False
+        if not request.tools or len(response.choices) != 1:
+            return False
+        if (request.n or 1) != 1:
+            return False
+        if self._get_tool_parser_retry_count(request) >= (
+            envs.VLLM_TOOL_PARSER_ERROR_MAX_RETRIES
+        ):
+            return False
+
+        tool_choice = request.tool_choice
+        if tool_choice not in ("auto", "required", None):
+            return False
+        if tool_choice in ("auto", None) and not self.enable_auto_tools:
+            return False
+
+        choice = response.choices[0]
+        if choice.message.tool_calls or choice.finish_reason == "length":
+            return False
+
+        if tool_choice == "required":
+            return True
+
+        content = choice.message.content or ""
+        return any(marker in content for marker in _TOOL_PARSER_RETRY_MARKERS)
+
+    def _build_tool_parser_retry_request(
+        self,
+        request: ChatCompletionRequest,
+        response: ChatCompletionResponse,
+    ) -> ChatCompletionRequest:
+        retry_request = request.model_copy(deep=True)
+        failed_content = response.choices[0].message.content
+        feedback = (
+            _TOOL_PARSER_REQUIRED_RETRY_FEEDBACK
+            if request.tool_choice == "required"
+            else _TOOL_PARSER_RETRY_FEEDBACK
+        )
+
+        if failed_content:
+            retry_request.messages.append(
+                {"role": "assistant", "content": failed_content}
+            )
+        retry_request.messages.append({"role": "user", "content": feedback})
+        return retry_request
 
     async def render_chat_request(
         self,
@@ -340,7 +426,7 @@ class OpenAIServingChat(OpenAIServing):
                 reasoning_parser,
             )
 
-        return await self.chat_completion_full_generator(
+        response = await self.chat_completion_full_generator(
             request,
             result_generator,
             request_id,
@@ -350,6 +436,18 @@ class OpenAIServingChat(OpenAIServing):
             request_metadata,
             reasoning_parser,
         )
+        if (
+            isinstance(response, ChatCompletionResponse)
+            and self._should_retry_tool_parser_failure(request, response)
+        ):
+            logger.warning(
+                "Retrying request %s after likely tool parser failure",
+                request_id,
+            )
+            retry_request = self._build_tool_parser_retry_request(request, response)
+            return await self.create_chat_completion(retry_request, raw_request)
+
+        return response
 
     def get_chat_request_role(self, request: ChatCompletionRequest) -> str:
         if request.add_generation_prompt:
